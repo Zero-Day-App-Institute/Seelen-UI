@@ -2,12 +2,15 @@ mod app_bar;
 mod com;
 mod devices;
 pub mod event_window;
+pub mod icon;
 pub mod input;
 mod iterator;
 pub mod msix;
+pub mod pwsh;
 pub mod string_utils;
 pub mod types;
 pub mod undocumented;
+pub mod virtual_desktop;
 pub mod window_badges;
 // partially consumed (app badges), the rest will be used by a future refactor of toasts
 #[allow(dead_code)]
@@ -21,7 +24,6 @@ pub use iterator::*;
 use itertools::Itertools;
 use string_utils::WindowsString;
 use types::ProcessInformationFlag;
-use widestring::U16CStr;
 use windows_core::{Interface, Owned, RuntimeType};
 use windows_future::{AsyncStatus, IAsyncOperation};
 
@@ -50,8 +52,8 @@ use windows::{
             PHYSICAL_MONITOR,
         },
         Foundation::{
-            GetLastError, HANDLE, HMODULE, HWND, LPARAM, LUID, MAX_PATH, POINT, RECT,
-            STATUS_SUCCESS, SetLastError, WIN32_ERROR, WPARAM,
+            GetLastError, HANDLE, HMODULE, HWND, LPARAM, LUID, POINT, RECT, STATUS_SUCCESS,
+            SetLastError, WIN32_ERROR, WPARAM,
         },
         Graphics::{
             Dwm::{
@@ -112,16 +114,14 @@ use windows::{
                 ShellExecuteExW, ShellLink, ShellWindows, VirtualDesktopManager,
             },
             WindowsAndMessaging::{
-                DispatchMessageW, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
-                GetDesktopWindow, GetForegroundWindow, GetParent, GetPropW, GetWindow,
-                GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-                HWND_BROADCAST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, MSG, PM_REMOVE,
-                PeekMessageW, PostMessageW, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD,
-                SPI_GETDESKWALLPAPER, SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
-                SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-                SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
-                SendNotifyMessageW, SetWindowPos, ShowWindow, ShowWindowAsync,
-                SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+                ASFW_ANY, AllowSetForegroundWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
+                GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetDesktopWindow, GetForegroundWindow,
+                GetParent, GetPropW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
+                GetWindowThreadProcessId, HWND_BROADCAST, IsIconic, IsWindow, IsWindowVisible,
+                IsZoomed, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SET_WINDOW_POS_FLAGS,
+                SHOW_WINDOW_CMD, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SendNotifyMessageW, SetWindowPos,
+                ShowWindow, ShowWindowAsync, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
                 WM_SETTINGCHANGE, WS_SIZEBOX, WS_THICKFRAME,
             },
         },
@@ -984,40 +984,6 @@ impl WindowsApi {
         Ok(desktop_id)
     }
 
-    pub fn get_wallpaper() -> Result<PathBuf> {
-        let mut path = [0_u16; MAX_PATH as usize];
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETDESKWALLPAPER,
-                MAX_PATH,
-                Some(path.as_mut_ptr() as _),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            )?;
-        }
-        Ok(PathBuf::from(
-            U16CStr::from_slice_truncate(&path)?
-                .to_ustring()
-                .to_string_lossy(),
-        ))
-    }
-
-    pub fn set_wallpaper(path: PathBuf) -> Result<()> {
-        if !path.exists() {
-            return Err("File not found".into());
-        }
-
-        let mut path = WindowsString::from(path);
-        unsafe {
-            SystemParametersInfoW(
-                SPI_SETDESKWALLPAPER,
-                MAX_PATH,
-                Some(path.as_mut_slice().as_mut_ptr() as _),
-                SPIF_SENDCHANGE | SPIF_UPDATEINIFILE,
-            )?;
-        }
-        Ok(())
-    }
-
     /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-exitwindowsex
     pub fn exit_windows(flags: EXIT_WINDOWS_FLAGS, reason: SHUTDOWN_REASON) -> Result<()> {
         WindowsApi::enable_privilege(SE_SHUTDOWN_NAME)?;
@@ -1165,6 +1131,27 @@ impl WindowsApi {
         })))
     }
 
+    /// Resolve paths with folder ids in the form of "{GUID}\path\to\file"
+    ///
+    /// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+    pub fn resolve_guid_path<S: AsRef<str>>(path: S) -> Result<PathBuf> {
+        let parts = path.as_ref().split("\\");
+        let mut path_buf = PathBuf::new();
+
+        for (idx, part) in parts.into_iter().enumerate() {
+            if part.starts_with("{") && part.ends_with("}") {
+                let guid = part.trim_start_matches('{').trim_end_matches('}');
+                path_buf.push(Self::known_folder(GUID::try_from(guid)?)?);
+            } else if idx == 0 {
+                return Ok(PathBuf::from(path.as_ref()));
+            } else {
+                path_buf.push(part);
+            }
+        }
+
+        Ok(path_buf)
+    }
+
     #[allow(dead_code)]
     pub fn known_folder_item(folder_id: windows::core::GUID) -> Result<()> {
         let item: IShellItem2 = unsafe { SHGetKnownFolderItem(&folder_id, KF_FLAG_DEFAULT, None)? };
@@ -1299,6 +1286,11 @@ impl WindowsApi {
         elevated: bool,
     ) -> Result<()> {
         log::trace!("Running: {program:?} with args: {args:?} in working dir: {working_dir:?}");
+        // The app is launched by explorer (or by us as fallback), which doesn't own the
+        // foreground, so Windows' foreground lock would open it behind the focused window.
+        // Hand our foreground rights to whoever claims them next; this only succeeds while we
+        // hold them (e.g. right after a click on the dock or another widget), so failure is fine.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
         match Self::shell_execute_through_explorer(&program, &args, &working_dir, elevated) {
             Ok(()) => return Ok(()),
             Err(err) => log::error!("Failed to execute through explorer, falling back: {err}"),
